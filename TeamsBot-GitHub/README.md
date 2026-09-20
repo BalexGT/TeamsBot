@@ -4,7 +4,7 @@ TeamsBot is a macOS desktop helper that watches Microsoft Teams locally for a
 fresh poll card and, only after its local safety checks pass, can target the
 current card's **Submit** control.
 
-This repository is the **standard TeamsBot build**. It is an internal beta,
+This repository is the **TeamsBot build**. It is an internal beta,
 not a released product.
 
 ## What it does
