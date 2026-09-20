@@ -15,8 +15,6 @@ not a released product.
   and Teams' **Last read** boundary before any normal-mode action.
 - Keeps timestamp-only local history to avoid repeat work. It does not retain
   screenshots, poll questions, or answer text.
-- Uses the supplied TeamsBot robot mark for the window, Dock, and menu-bar
-  identity.
 
 ## Requirements
 
