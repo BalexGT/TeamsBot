@@ -18,7 +18,7 @@ not a released product.
 
 ## Requirements
 
-- macOS on Apple silicon
+- macOS (Apple Silicon Recomended)
 - Python 3.14 with the project dependencies
 - PyInstaller, Xcode Command Line Tools, and Screen Recording + Accessibility
   permissions for the installed app
