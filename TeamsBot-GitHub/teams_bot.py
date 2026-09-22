@@ -12,6 +12,7 @@ import time
 import traceback
 import webbrowser
 import tkinter as tk
+from collections import namedtuple
 from tkinter import messagebox
 from datetime import datetime, timedelta
 
@@ -20,8 +21,20 @@ import Quartz
 from PIL import Image, ImageTk
 from AppKit import (NSEvent, NSEventMaskKeyDown, NSEventMaskLeftMouseDown,
                     NSEventMaskOtherMouseDown, NSEventMaskRightMouseDown,
+                    NSApplicationActivateIgnoringOtherApps, NSRunningApplication,
                     NSScreen, NSSound)
 import ApplicationServices as Accessibility
+
+try:
+    import cv2
+    # OpenCV's default parallel matcher has aborted intermittently on this
+    # macOS beta while the monitor is matching small UI templates. TeamsBot
+    # only compares a few compact controls, so one worker is more than fast
+    # enough and avoids that unstable parallel path.
+    cv2.setNumThreads(1)
+    cv2.ocl.setUseOpenCL(False)
+except Exception:
+    cv2 = None
 
 from graph_integration import GraphIntegration
 
@@ -36,6 +49,12 @@ class OCRHelperTimeoutError(RuntimeError):
 
 class OCRHelperBusyError(RuntimeError):
     """Raised when another short-lived OCR request already owns the helper."""
+
+
+# Newer PyAutoGUI builds do not guarantee that their internal ``Box`` helper is
+# exported. TeamsBot only needs a small tuple with these four coordinates, so
+# keeping its own removes a packaging-version dependency from monitor fallbacks.
+ScreenBox = namedtuple("ScreenBox", "left top width height")
 
 
 class HoverTip:
@@ -77,7 +96,7 @@ class HoverTip:
 class TeamsBotConsoleGUI:
     """A macOS helper that verifies a Teams poll before clicking its target."""
 
-    APP_VERSION = "0.6.0-beta.7"
+    APP_VERSION = "0.6.0-beta.15.1"
     GRAPH_BETA_VERSION = "0.7.0-graph-beta.12"
     RELEASE_TARGET = "1.0.0"
     RELEASE_STAGE = "Internal beta"
@@ -148,8 +167,10 @@ class TeamsBotConsoleGUI:
         self.extended_search_debug = tk.BooleanVar(value=False)
         self.detailed_activity_log = tk.BooleanVar(value=False)
         self.continuous_timestamp_scan = tk.BooleanVar(value=False)
+        self.archive_capture_mode = tk.BooleanVar(value=False)
         self.allow_redundant_timestamp_logs = tk.BooleanVar(value=False)
         self.monitor_thread = None
+        self.template_match_lock = threading.Lock()
         self.spinner_index = 0
         self.last_clicked_signature = None
         self.candidate_signature = None
@@ -161,6 +182,13 @@ class TeamsBotConsoleGUI:
         self.new_messages_indicator_box = None
         self.last_new_messages_probe = 0.0
         self.pending_notification_signal = False
+        # A successful press on Teams' own New messages control is stronger
+        # evidence than a generic notification. It lets the timestamp gate
+        # interpret a card-local bare clock (for example, "12:18 AM") during
+        # this one, bounded fresh-activity review window.
+        self.new_messages_jump_until = 0.0
+        self.bare_timestamp_retry_count = 0
+        self.last_teams_activation_detail = "not requested"
         self.menu_bar_process = None
         self.pending_previous_app = None
         self.accessibility_prompted = False
@@ -170,18 +198,23 @@ class TeamsBotConsoleGUI:
         self.pending_poll_seen_at = None
         self.pending_poll_anchor = None
         self.last_verified_poll_timestamps = []
+        self.last_poll_time_check = None
         # A single pre-click OCR packet is shared by the timestamp, Last read,
         # and completion checks. It is intentionally transient and contains no
         # retained poll content.
         self.last_poll_context = None
         self.history_path = os.path.join(self.support_directory, "poll-history.jsonl")
         self.timestamp_index_path = os.path.join(self.support_directory, "seen-timestamps.json")
+        self.timestamp_archive_path = os.path.join(self.support_directory, "timestamp-archive.json")
+        self.timestamp_outcomes_path = os.path.join(self.support_directory, "timestamp-outcomes.json")
         self.handled_poll_index_path = os.path.join(self.support_directory, "noted-poll-timestamps.json")
         self.scan_trace_path = os.path.join(self.support_directory, "continuous-scan.jsonl")
         self.error_trace_path = os.path.join(self.support_directory, "diagnostic-errors.jsonl")
         self.state_manifest_path = os.path.join(self.support_directory, "scan-state-manifest.json")
         self.session_cross_reference_path = os.path.join(self.support_directory, "session-cross-reference.jsonl")
         self.seen_timestamp_keys = set()
+        self.archived_timestamp_keys = set()
+        self.timestamp_outcomes = {}
         self.noted_poll_timestamp_keys = set()
         self.shortcuts_commands_path = os.path.join(self.support_directory, "shortcuts-commands.jsonl")
         self.menu_commands_path = os.path.join(self.support_directory, "menu-commands.jsonl")
@@ -226,6 +259,8 @@ class TeamsBotConsoleGUI:
         self.root.after(1200, self.refresh_system_appearance)
         self.cleanup_stale_capture_files()
         self.load_seen_timestamps()
+        self.load_archived_timestamps()
+        self.load_timestamp_outcomes()
         self.load_noted_poll_timestamps()
         self.write_state_manifest("startup")
         self.prepare_shortcuts_bridge()
@@ -381,16 +416,14 @@ class TeamsBotConsoleGUI:
         self.root.attributes("-alpha", 1.0)
 
     def on_focus_out(self, _event=None):
-        # Let Teams remain legible underneath when the bot has brought it
-        # forward to inspect a poll.  Other unfocused apps use a gentler fade.
-        self.root.after(120, self.refresh_inactive_opacity)
+        # The utility may sit beside Teams while monitoring, but it must
+        # remain fully opaque.  The previous inactive-window fade made the
+        # desktop show through the controls and looked like a rendering bug.
+        self.root.attributes("-alpha", 1.0)
 
     def refresh_inactive_opacity(self):
-        if self.root.focus_displayof() is not None:
-            return
-        active = self.active_app_name()
-        alpha = 0.52 if active in {"Teams", "Microsoft Teams"} else 0.82
-        self.root.attributes("-alpha", alpha)
+        """Compatibility no-op for older scheduled callbacks."""
+        self.root.attributes("-alpha", 1.0)
 
     def setup_ui(self):
         try:
@@ -462,12 +495,7 @@ class TeamsBotConsoleGUI:
             selectcolor=self.SURFACE, font=("Helvetica Neue", 10), highlightthickness=0
         )
 
-        self.test_btn = tk.Button(self.root, text="Run detection check", command=self.run_debug_check,
-                                  bg=self.BG, fg=self.BLUE, activebackground=self.BG,
-                                  activeforeground=self.TEXT, relief=tk.FLAT, bd=0,
-                                  font=("Helvetica Neue", 10, "bold"), cursor="hand2")
         HoverTip(self.debug_check, "Test mode finds and reports eligible polls but never clicks Submit.")
-        HoverTip(self.test_btn, "Runs one visual detection pass now. It does not start continuous monitoring.")
 
         self.tune_btn = tk.Button(self.root, text="Test click current", command=self.run_test_click,
                                   bg=self.BG, fg=self.BLUE, activebackground=self.BG,
@@ -488,11 +516,17 @@ class TeamsBotConsoleGUI:
         self.stop_btn = tk.Label(self.root, text="Stop Monitoring", bg=self.CONTROL, fg=self.DISABLED,
                                  highlightthickness=1, highlightbackground=self.BORDER,
                                  font=("Helvetica Neue", 11, "bold"), cursor="arrow", anchor=tk.CENTER)
-        self.stop_btn.bind("<Button-1>", lambda _event: self.stop_monitoring() if self.is_monitoring else None)
+        self.stop_btn.bind(
+            "<Button-1>",
+            lambda _event: self.stop_monitoring()
+            if (self.is_monitoring or self.continuous_timestamp_scan.get()) else None,
+        )
         # Teal is reserved for the active monitoring state. Stop remains a
         # neutral, readable action even while it is available.
-        self.stop_btn.bind("<Enter>", lambda _event: self.stop_btn.config(bg=self.CONTROL) if self.is_monitoring else None)
-        self.stop_btn.bind("<Leave>", lambda _event: self.stop_btn.config(bg=self.SURFACE) if self.is_monitoring else None)
+        self.stop_btn.bind("<Enter>", lambda _event: self.stop_btn.config(bg=self.CONTROL)
+                           if (self.is_monitoring or self.continuous_timestamp_scan.get()) else None)
+        self.stop_btn.bind("<Leave>", lambda _event: self.stop_btn.config(bg=self.SURFACE)
+                           if (self.is_monitoring or self.continuous_timestamp_scan.get()) else None)
         self.stop_btn.place(x=259, y=300, width=215, height=42)
         self.debug_menu = tk.Menu(self.root, tearoff=0)
         self.diagnostic_menu_items = {}
@@ -507,14 +541,14 @@ class TeamsBotConsoleGUI:
         self.debug_menu.add_checkbutton(label="Show technical details in Activity", variable=self.detailed_activity_log)
         self.diagnostic_menu_items["detailed_activity"] = self.debug_menu.index(tk.END)
         self.debug_menu.add_separator()
-        self.debug_menu.add_command(label="Inspect current screen", command=self.run_debug_check)
-        self.diagnostic_menu_items["inspect"] = self.debug_menu.index(tk.END)
         self.debug_menu.add_command(label="Test newest Submit", command=self.run_test_click)
         self.diagnostic_menu_items["test_submit"] = self.debug_menu.index(tk.END)
         self.timestamp_menu = tk.Menu(self.debug_menu, tearoff=0)
         self.timestamp_menu.add_command(label="Scan once", command=self.run_screen_timestamp_scan)
-        self.timestamp_menu.add_checkbutton(label="Continuous scan", variable=self.continuous_timestamp_scan,
+        self.timestamp_menu.add_checkbutton(label="Continuous scan (diagnostic)", variable=self.continuous_timestamp_scan,
                                             command=self.toggle_continuous_timestamp_scan)
+        self.timestamp_menu.add_checkbutton(label="Archive visible history", variable=self.archive_capture_mode,
+                                            command=self.toggle_archive_capture_mode)
         self.timestamp_menu.add_checkbutton(label="Repeat known entries", variable=self.allow_redundant_timestamp_logs)
         self.debug_menu.add_cascade(label="Timestamp tools", menu=self.timestamp_menu)
         self.diagnostic_menu_items["timestamps"] = self.debug_menu.index(tk.END)
@@ -528,22 +562,25 @@ class TeamsBotConsoleGUI:
         self.diagnostic_menu_items["shortcuts"] = self.debug_menu.index(tk.END)
         self.debug_menu.add_command(label="Poll History…", command=self.show_poll_history)
         self.diagnostic_menu_items["history"] = self.debug_menu.index(tk.END)
+        self.debug_menu.add_command(label="Timestamp Log…", command=self.show_timestamp_log)
+        self.diagnostic_menu_items["timestamp_log"] = self.debug_menu.index(tk.END)
         self.diagnostic_tooltips = {
             self.diagnostic_menu_items["guide"]: "A plain-language explanation of every diagnostic tool.",
             self.diagnostic_menu_items["safe_mode"]: "Prevents every Submit click while you test detection.",
             self.diagnostic_menu_items["extended_search"]: "Lets Safe test mode search longer, up to five minutes.",
-            self.diagnostic_menu_items["inspect"]: "Checks the current screen once and reports what is visible.",
             self.diagnostic_menu_items["test_submit"]: "Supervised test: finds the newest Submit target for calibration.",
             self.diagnostic_menu_items["timestamps"]: "Tools for checking visible Teams times without reading poll text.",
             self.diagnostic_menu_items["repair"]: "Checks saved scan records, backs up damaged files, and rebuilds only safe state.",
             self.diagnostic_menu_items["new_session"]: "Archives this session, then clears the local scan baseline after confirmation.",
             self.diagnostic_menu_items["shortcuts"]: "Shows optional local Shortcuts and Siri controls.",
             self.diagnostic_menu_items["history"]: "Shows the local safety and timestamp record.",
+            self.diagnostic_menu_items["timestamp_log"]: "Shows current and archived Teams timestamps without poll text or screenshots.",
         }
         self.timestamp_tooltips = {
-            0: "Checks visible Teams timestamps one time.",
-            1: "Keeps checking timestamps for troubleshooting; pauses during normal monitoring.",
-            2: "Shows timestamps already recorded in the Activity panel too.",
+            0: "Checks visible Teams timestamps once; use it to confirm what the screen can read.",
+            1: "Repeatedly records timestamps you scroll into view; it stops normal Monitoring while active.",
+            2: "During Continuous Scan, saves each clearly dated timestamp on its first read to the separate history archive.",
+            3: "Shows already recorded timestamps again in Activity; useful only when comparing scans.",
         }
         self.debug_menu.bind("<<MenuSelect>>", lambda _event: self.show_diagnostic_tooltip(self.debug_menu, self.diagnostic_tooltips))
         self.timestamp_menu.bind("<<MenuSelect>>", lambda _event: self.show_diagnostic_tooltip(self.timestamp_menu, self.timestamp_tooltips))
@@ -559,7 +596,16 @@ class TeamsBotConsoleGUI:
                 return
             helper = self.resource_path("teamsbot_menu_bar")
             if os.path.isfile(helper):
-                self.menu_bar_process = subprocess.Popen([helper], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                # The native status item is intentionally separate from Tk so
+                # it remains responsive while the console is hidden. Give it
+                # this process ID, however, so it can remove itself if the
+                # main app exits unexpectedly rather than leaving a ghost
+                # icon with no TeamsBot window behind.
+                self.menu_bar_process = subprocess.Popen(
+                    [helper, "--parent-pid", str(os.getpid())],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
                 if schedule_health_check:
                     # The helper has its own instance lock.  A one-time retry
                     # covers macOS launching the app before the status server
@@ -622,7 +668,6 @@ class TeamsBotConsoleGUI:
             state=tk.NORMAL if (not self.is_monitoring and self.debug_mode.get()) else tk.DISABLED,
         )
         self.debug_menu.entryconfig(items["detailed_activity"], state=tk.NORMAL)
-        self.debug_menu.entryconfig(items["inspect"], state=state)
         self.debug_menu.entryconfig(items["test_submit"], state=state)
         # Continuous scan can intentionally take over from monitoring, so
         # timestamp tools stay reachable while the monitor is running.
@@ -674,10 +719,10 @@ class TeamsBotConsoleGUI:
             "Safe test mode\nFinds eligible polls but never clicks Submit.\n\n"
             "Extended search\nIn safe test mode, permits a longer bounded search for troubleshooting.\n\n"
             "Show technical details in Activity\nShows scan counts, timings, and exact safety reasons in the main Activity panel. Leave it off for plain-language updates.\n\n"
-            "Inspect current screen\nMakes one visual pass and reports whether it can see a Submit target.\n\n"
             "Test newest Submit\nMoves to the newest visible Submit for calibration. It intentionally bypasses normal timestamp history, so use it only for supervised testing.\n\n"
-            "Timestamp tools\nScans visible date-qualified Teams timestamps once or continuously. Continuous scan is diagnostic-only; turning it on stops normal monitoring first.\n\n"
-            "Poll History\nShows the local record of safety decisions and timestamps. No screenshots or poll text are kept."
+            "Timestamp tools\nScan once checks the currently visible date-qualified Teams timestamps. Continuous scan repeats that check while you manually scroll through the Teams chat. Turn on Archive visible history first to save each clearly dated marker on its first read in the separate Timestamp Log history; those archival markers never affect live poll safety. It does not scroll for you, and it automatically stops normal Monitoring. Stop it with Stop Monitoring when you are done.\n\n"
+            "Poll History\nShows the local record of safety decisions and timestamps. No screenshots or poll text are kept.\n\n"
+            "Timestamp Log\nShows the saved Teams timestamps themselves, including whether a timestamp has already been used to prevent a repeated poll action."
         )
 
     def show_graph_integration_status(self):
@@ -875,6 +920,18 @@ class TeamsBotConsoleGUI:
                 return plain
         return message
 
+    @staticmethod
+    def describe_timestamp_age(age_seconds):
+        """Describe a Teams timestamp age in plain language for the Activity log."""
+        if age_seconds < 0:
+            seconds = round(abs(age_seconds))
+            return "at the current minute" if seconds < 30 else "slightly ahead of the current minute"
+        seconds = round(abs(age_seconds))
+        if seconds < 60:
+            return "less than a minute old"
+        minutes = seconds // 60
+        return f"{minutes} minute{'s' if minutes != 1 else ''} old"
+
     def describe_error(self, error):
         """Give UI logs a useful description even for empty exception strings."""
         text = str(error).strip()
@@ -929,6 +986,24 @@ class TeamsBotConsoleGUI:
         except (OSError, ValueError, TypeError):
             self.seen_timestamp_keys = set()
 
+    def load_archived_timestamps(self):
+        """Load timestamps captured during an explicit diagnostic archive scan.
+
+        These markers are intentionally separate from the normal timestamp
+        safety index: they document visible history but never influence a
+        live poll's no-repeat or age decision.
+        """
+        self.archived_timestamp_keys = set(self.read_timestamp_keys(self.timestamp_archive_path))
+
+    def load_timestamp_outcomes(self):
+        """Load evidence-backed poll outcomes keyed only by timestamp."""
+        try:
+            with open(self.timestamp_outcomes_path, "r", encoding="utf-8") as outcomes_file:
+                values = json.load(outcomes_file)
+            self.timestamp_outcomes = values if isinstance(values, dict) else {}
+        except (OSError, ValueError, TypeError):
+            self.timestamp_outcomes = {}
+
     def load_noted_poll_timestamps(self):
         """Load only timestamp identities already accepted for a poll review.
 
@@ -972,6 +1047,8 @@ class TeamsBotConsoleGUI:
             pass
         return {
             "seen_timestamps": len(self.seen_timestamp_keys),
+            "archived_timestamps": len(self.archived_timestamp_keys),
+            "timestamp_outcomes": len(self.timestamp_outcomes),
             "noted_poll_timestamps": len(self.noted_poll_timestamp_keys),
             "history_entries": history_entries,
             "invalid_history_lines": invalid_history_lines,
@@ -1015,6 +1092,7 @@ class TeamsBotConsoleGUI:
         healthy = []
         for label, path, attribute in (
             ("timestamp index", self.timestamp_index_path, "seen_timestamp_keys"),
+            ("history capture index", self.timestamp_archive_path, "archived_timestamp_keys"),
             ("poll no-repeat index", self.handled_poll_index_path, "noted_poll_timestamp_keys"),
         ):
             if not os.path.exists(path):
@@ -1050,9 +1128,13 @@ class TeamsBotConsoleGUI:
             messagebox.showinfo("Start New Session", "Stop monitoring before starting a new session.")
             return
         confirmed = messagebox.askyesno(
-            "Start New Session?",
-            "This archives the current scan history and timestamp indexes, then starts a clean local baseline. "
-            "Old polls will still be checked conservatively. Continue?",
+            "Are You Sure You Want to Start a New Session?",
+            "This is normally only needed when you intentionally want a fresh scan baseline.\n\n"
+            "Why the caution: saved timestamps and poll markers help TeamsBot recognize polls it has already seen, "
+            "so it does not revisit an old poll by mistake.\n\n"
+            "Choosing Continue archives the current logs and markers safely, then starts a new empty working set. "
+            "Nothing is deleted, but the new session will no longer use the previous markers during its normal checks.\n\n"
+            "Continue only if you meant to begin a new session.",
             icon="warning",
         )
         if not confirmed:
@@ -1062,7 +1144,7 @@ class TeamsBotConsoleGUI:
         previous = self.tracking_state_summary()
         archived = []
         for path in (
-            self.history_path, self.timestamp_index_path, self.handled_poll_index_path,
+            self.history_path, self.timestamp_index_path, self.timestamp_archive_path, self.timestamp_outcomes_path, self.handled_poll_index_path,
             self.scan_trace_path, self.error_trace_path, self.state_manifest_path,
         ):
             if os.path.exists(path):
@@ -1070,6 +1152,8 @@ class TeamsBotConsoleGUI:
                 shutil.move(path, os.path.join(archive_directory, os.path.basename(path)))
                 archived.append(os.path.basename(path))
         self.seen_timestamp_keys.clear()
+        self.archived_timestamp_keys.clear()
+        self.timestamp_outcomes.clear()
         self.noted_poll_timestamp_keys.clear()
         self.baseline_existing_present = False
         self.ignore_visible_poll = False
@@ -1153,6 +1237,50 @@ class TeamsBotConsoleGUI:
             event = "startup_timestamp_baseline" if baseline else "historic_teams_timestamp"
             self.record_history(event, labels=historical_labels, source=source)
         return current_labels + historical_labels
+
+    def record_archive_timestamp_labels(self, labels, source):
+        """Persist date-qualified history captured by the user-driven archive scan.
+
+        This deliberately does not touch ``seen_timestamp_keys``. Its only job
+        is to make an auditable, timestamp-only record while the user scrolls
+        through older Teams history.
+        """
+        new_labels = []
+        with self.timestamp_lock:
+            for label in labels:
+                normalized, key = self.normalized_timestamp(label)
+                if key and key not in self.archived_timestamp_keys:
+                    self.archived_timestamp_keys.add(key)
+                    new_labels.append(normalized)
+            if not new_labels:
+                return []
+            try:
+                os.makedirs(os.path.dirname(self.timestamp_archive_path), exist_ok=True)
+                with open(self.timestamp_archive_path, "w", encoding="utf-8") as archive_file:
+                    json.dump(sorted(self.archived_timestamp_keys), archive_file)
+            except OSError:
+                pass
+        self.record_history("timestamps_archived", labels=new_labels, source=source)
+        return new_labels
+
+    def mark_timestamp_outcome(self, labels, status):
+        """Store only a confirmed poll outcome; never infer one from a scan."""
+        if not labels:
+            return
+        changed = False
+        now = datetime.now().astimezone().isoformat(timespec="seconds")
+        with self.timestamp_lock:
+            for label in labels:
+                _normalized, key = self.normalized_timestamp(label)
+                if key and self.timestamp_outcomes.get(key, {}).get("status") != status:
+                    self.timestamp_outcomes[key] = {"status": status, "updated_at": now}
+                    changed = True
+            if changed:
+                try:
+                    with open(self.timestamp_outcomes_path, "w", encoding="utf-8") as outcomes_file:
+                        json.dump(self.timestamp_outcomes, outcomes_file, indent=2, sort_keys=True)
+                except OSError:
+                    pass
 
     @staticmethod
     def normalized_timestamp(label):
@@ -1242,6 +1370,7 @@ class TeamsBotConsoleGUI:
             "test_mode": bool(self.debug_mode.get()),
             "technical_details": bool(self.detailed_activity_log.get()),
             "continuous_timestamp_scan": bool(self.continuous_timestamp_scan.get()),
+            "archive_capture_mode": bool(self.archive_capture_mode.get()),
             "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         }
         try:
@@ -1307,8 +1436,6 @@ class TeamsBotConsoleGUI:
         elif command == "toggle_technical_details":
             self.detailed_activity_log.set(not self.detailed_activity_log.get())
             self.log("Technical details were toggled from the menu bar.", "info")
-        elif command == "inspect_current":
-            self.run_debug_check()
         elif command == "test_newest_submit":
             self.run_test_click()
         elif command == "scan_timestamps":
@@ -1316,12 +1443,17 @@ class TeamsBotConsoleGUI:
         elif command == "toggle_continuous_scan":
             self.continuous_timestamp_scan.set(not self.continuous_timestamp_scan.get())
             self.toggle_continuous_timestamp_scan()
+        elif command == "toggle_archive_capture":
+            self.archive_capture_mode.set(not self.archive_capture_mode.get())
+            self.toggle_archive_capture_mode()
         elif command == "repair_scan_state":
             self.verify_and_repair_scan_state()
         elif command == "new_session":
             self.start_new_session()
         elif command == "poll_history":
             self.show_poll_history()
+        elif command == "timestamp_log":
+            self.show_timestamp_log()
         elif command == "quit":
             self.quit_from_menu_bar()
         else:
@@ -1383,6 +1515,140 @@ class TeamsBotConsoleGUI:
         done_button.bind("<Leave>", lambda _event: done_button.config(bg=self.SURFACE))
         done_button.place(x=510, y=414, width=86, height=30)
         refresh()
+
+    def show_timestamp_log(self):
+        """Show saved timestamp identities in the same readable form as history."""
+        window = tk.Toplevel(self.root)
+        window.title("Timestamp Log")
+        window.geometry("620x458")
+        window.resizable(False, False)
+        window.configure(bg=self.BG)
+        window.transient(self.root)
+        window.lift()
+
+        tk.Label(window, text="Timestamp Log", bg=self.BG, fg=self.TEXT,
+                 font=("Helvetica Neue", 20, "bold")).place(x=24, y=18)
+        tk.Label(window, text="Current and archived Teams time markers", bg=self.BG, fg=self.MUTED,
+                 font=("Helvetica Neue", 11)).place(x=26, y=51)
+        tk.Label(window, text="No poll text or screenshots are stored.", bg=self.BG, fg=self.MUTED,
+                 font=("Helvetica Neue", 10)).place(x=26, y=71)
+
+        log_frame = tk.Frame(window, bg=self.SURFACE, highlightthickness=1,
+                            highlightbackground=self.BORDER)
+        log_frame.place(x=24, y=102, width=572, height=294)
+        log_text = tk.Text(log_frame, bg=self.SURFACE, fg=self.TEXT,
+                           font=("Helvetica Neue", 11), wrap=tk.WORD,
+                           state=tk.DISABLED, bd=0, highlightthickness=0,
+                           padx=14, pady=12, insertbackground=self.TEXT,
+                           selectbackground=self.BLUE, selectforeground="#ffffff")
+        log_scrollbar = tk.Scrollbar(log_frame, command=log_text.yview)
+        log_text.configure(yscrollcommand=log_scrollbar.set)
+        log_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        def refresh():
+            log_text.config(state=tk.NORMAL)
+            log_text.delete("1.0", tk.END)
+            entries = self.read_timestamp_log_entries()
+            if entries:
+                for line in entries:
+                    log_text.insert(tk.END, line + "\n")
+            else:
+                log_text.insert(tk.END, "No Teams timestamps have been recorded yet.\n")
+            log_text.see(tk.END)
+            log_text.config(state=tk.DISABLED)
+
+        refresh_button = tk.Label(window, text="Refresh", bg=self.BLUE, fg="#ffffff",
+                                  highlightthickness=1, highlightbackground=self.BLUE,
+                                  font=("Helvetica Neue", 11, "bold"), cursor="hand2", anchor=tk.CENTER)
+        refresh_button.bind("<Button-1>", lambda _event: refresh())
+        refresh_button.bind("<Enter>", lambda _event: refresh_button.config(bg=self.BLUE_HOVER))
+        refresh_button.bind("<Leave>", lambda _event: refresh_button.config(bg=self.BLUE))
+        refresh_button.place(x=412, y=414, width=88, height=30)
+        done_button = tk.Label(window, text="Done", bg=self.SURFACE, fg=self.TEXT,
+                               highlightthickness=1, highlightbackground=self.BORDER,
+                               font=("Helvetica Neue", 11, "bold"), cursor="hand2", anchor=tk.CENTER)
+        done_button.bind("<Button-1>", lambda _event: window.destroy())
+        done_button.bind("<Enter>", lambda _event: done_button.config(bg=self.CONTROL))
+        done_button.bind("<Leave>", lambda _event: done_button.config(bg=self.SURFACE))
+        done_button.place(x=510, y=414, width=86, height=30)
+        refresh()
+
+    @staticmethod
+    def read_timestamp_keys(path):
+        """Read one timestamp-only index, treating an absent/corrupt file as empty."""
+        try:
+            with open(path, "r", encoding="utf-8") as index_file:
+                values = json.load(index_file)
+            return sorted({value for value in values if isinstance(value, str)}) if isinstance(values, list) else []
+        except (OSError, ValueError, TypeError):
+            return []
+
+    @staticmethod
+    def read_timestamp_outcomes(path):
+        try:
+            with open(path, "r", encoding="utf-8") as outcomes_file:
+                values = json.load(outcomes_file)
+            return values if isinstance(values, dict) else {}
+        except (OSError, ValueError, TypeError):
+            return {}
+
+    @staticmethod
+    def archive_session_label(directory_name):
+        """Turn a session folder name into a readable archive label when possible."""
+        try:
+            return datetime.strptime(directory_name, "%Y%m%d-%H%M%S").strftime("%b %-d, %Y at %-I:%M %p")
+        except ValueError:
+            return directory_name
+
+    def read_timestamp_log_entries(self):
+        """Render current and archived timestamp keys without poll contents."""
+        with self.timestamp_lock:
+            current_used_for_poll = set(self.noted_poll_timestamp_keys)
+            current_outcomes = dict(self.timestamp_outcomes)
+
+        sources = []
+        sessions_directory = os.path.join(self.support_directory, "sessions")
+        for archive_path in sorted(glob.glob(os.path.join(sessions_directory, "*", "seen-timestamps.json"))):
+            archive_directory = os.path.dirname(archive_path)
+            archive_keys = self.read_timestamp_keys(archive_path)
+            archive_outcomes = self.read_timestamp_outcomes(os.path.join(archive_directory, "timestamp-outcomes.json"))
+            if archive_keys:
+                sources.append((f"Archived session — {self.archive_session_label(os.path.basename(archive_directory))}",
+                                archive_keys,
+                                set(self.read_timestamp_keys(os.path.join(archive_directory, "noted-poll-timestamps.json"))),
+                                archive_outcomes))
+            captured_keys = self.read_timestamp_keys(os.path.join(archive_directory, "timestamp-archive.json"))
+            if captured_keys:
+                sources.append((f"Archived history capture — {self.archive_session_label(os.path.basename(archive_directory))}",
+                                captured_keys, set(), archive_outcomes))
+
+        current_keys = self.read_timestamp_keys(self.timestamp_index_path)
+        if current_keys:
+            sources.append(("Current session", current_keys, current_used_for_poll, current_outcomes))
+        current_archive_keys = self.read_timestamp_keys(self.timestamp_archive_path)
+        if current_archive_keys:
+            sources.append(("Current history capture", current_archive_keys, set(), current_outcomes))
+
+        entries = []
+        for heading, keys, used_for_poll, outcomes in sources:
+            if entries:
+                entries.append("")
+            entries.append(heading)
+            for key in keys:
+                try:
+                    stamp = datetime.fromisoformat(key).astimezone()
+                    label = stamp.strftime("%a %b %-d, %-I:%M %p")
+                except (TypeError, ValueError):
+                    label = str(key)
+                if key in used_for_poll:
+                    suffix = " • Used for poll no-repeat protection"
+                elif isinstance(outcomes.get(key), dict) and outcomes[key].get("status"):
+                    suffix = " • " + str(outcomes[key]["status"])
+                else:
+                    suffix = " • Recorded (not assessed as a poll)"
+                entries.append(label + suffix)
+        return entries
 
     def read_poll_history(self):
         try:
@@ -1455,41 +1721,9 @@ class TeamsBotConsoleGUI:
             tk.Label(self.subtitle, text=text, bg=self.BG, fg=self.MUTED,
                      font=("Helvetica Neue", 11)).pack(side=tk.LEFT)
 
-    def run_debug_check(self):
-        if self.is_monitoring:
-            self.log("Stop the monitor before running a one-time detection check.", "warning")
-            return
-        self.test_btn.config(state=tk.DISABLED, text="Checking…")
-        threading.Thread(target=self.debug_check_worker, daemon=True).start()
-
-    def debug_check_worker(self):
-        previous_app = self.active_app_name()
-        try:
-            subprocess.run(["osascript", "-e", 'tell application "Microsoft Teams" to activate'], capture_output=True)
-            time.sleep(0.6)
-            visual = self.find_poll_visual(allow_ocr_fallback=True)
-            activity = self.check_validated_teams_logs()
-            if visual:
-                self.log(f"Screen match found at X {visual.left}, Y {visual.top} ({visual.width}×{visual.height}).", "success")
-                click_x, click_y = self.click_point_for(visual)
-                self.log(f"Dynamic click point: X {click_x}, Y {click_y} (button-relative; no click performed).", "info")
-            else:
-                self.log("No submit-button screen match found. Keep Teams visible and verify the reference image.", "warning")
-            self.log(f"Recent Teams activity signal: {'detected' if activity else 'not detected'} (diagnostic only).", "info")
-        except ScreenCapturePermissionError:
-            self.on_main(self.report_missing_screen_permission)
-        except Exception as error:
-            self.log(f"Detection check failed: {error}", "warning")
-        finally:
-            if previous_app and previous_app not in {"Teams", "Microsoft Teams"}:
-                subprocess.run(["osascript", "-e", f'tell application "{previous_app}" to activate'], capture_output=True)
-            self.on_main(self.test_btn.config, {"state": tk.NORMAL, "text": "Run detection check"})
-
     def run_test_click(self):
         """Locate the current Submit target; Diagnostics previews without clicking."""
-        if self.is_monitoring:
-            self.stop_monitoring()
-            self.log("Monitor paused for an immediate current-Submit test.", "info")
+        self.prepare_for_diagnostic_scan("the current-Submit test")
         self.tune_btn.config(state=tk.DISABLED, text="Locating…")
         threading.Thread(target=self.test_click_worker, daemon=True).start()
 
@@ -1531,10 +1765,31 @@ class TeamsBotConsoleGUI:
 
     def run_screen_timestamp_scan(self):
         """Read visible timestamp labels through Screen Recording, not Teams data."""
-        if self.is_monitoring:
-            self.log("Stop the monitor before running a one-time screen timestamp scan.", "warning")
-            return
+        self.prepare_for_diagnostic_scan("the visible timestamp scan")
         threading.Thread(target=self.screen_timestamp_scan_worker, daemon=True).start()
+
+    def prepare_for_diagnostic_scan(self, scan_name):
+        """Give a one-time diagnostic scan sole ownership of screen/OCR work."""
+        if self.is_monitoring:
+            self.stop_monitoring()
+            self.log(f"Monitoring stopped so {scan_name} can run.", "info")
+        if self.continuous_timestamp_scan.get():
+            self.stop_continuous_timestamp_scan()
+            self.log(f"Continuous scan stopped so {scan_name} can run.", "info")
+
+    def stop_continuous_timestamp_scan(self):
+        """Cancel continuous diagnostics; late OCR results are discarded."""
+        if not self.continuous_timestamp_scan.get():
+            return False
+        self.continuous_timestamp_scan.set(False)
+        self.timestamp_scan_token += 1
+        self.timestamp_scan_inflight = False
+        self.timestamp_scan_started_at = 0.0
+        self.timestamp_scan_watchdog_reported_token = None
+        self.record_continuous_scan_trace(event="disabled")
+        self.set_running_ui(False)
+        self.write_shortcuts_status()
+        return True
 
     def screen_timestamp_scan_worker(self):
         try:
@@ -1579,10 +1834,23 @@ class TeamsBotConsoleGUI:
             self.continuous_scan_last_report_signature = None
             self.log("Continuous timestamp scan is on. Each confirmed timestamp will be marked as newly logged or already recorded.", "info")
             self.record_continuous_scan_trace(event="enabled")
+            self.set_running_ui(False)
+            self.write_shortcuts_status()
             self.root.after(250, self.continuous_timestamp_scan_tick)
         else:
-            self.record_continuous_scan_trace(event="disabled")
-            self.log("Continuous timestamp scan is off.", "info")
+            if self.stop_continuous_timestamp_scan():
+                self.log("Continuous timestamp scan is off.", "info")
+
+    def toggle_archive_capture_mode(self):
+        """Keep user-driven history capture visibly separate from monitoring."""
+        self.write_shortcuts_status()
+        if self.archive_capture_mode.get():
+            self.log(
+                "Archive capture is ready. Start Continuous scan, then scroll Teams yourself; each clearly dated time marker will be saved on its first read.",
+                "info",
+            )
+        else:
+            self.log("Archive capture is off. Continuous scan will again require two matching reads before updating its normal timestamp record.", "info")
 
     def continuous_timestamp_scan_tick(self):
         if not self.continuous_timestamp_scan.get():
@@ -1590,7 +1858,7 @@ class TeamsBotConsoleGUI:
         if self.is_monitoring:
             # The monitor and Vision OCR both need the same screen surface.
             # Do not leave a checked setting that is silently doing nothing.
-            self.continuous_timestamp_scan.set(False)
+            self.stop_continuous_timestamp_scan()
             self.record_continuous_scan_trace(event="paused_for_monitoring")
             self.log("Continuous timestamp scan paused because normal monitoring is active. Stop monitoring, then enable the diagnostic scan again.", "warning")
             return
@@ -1637,6 +1905,14 @@ class TeamsBotConsoleGUI:
             # switched continuous scanning off.
             if not self.continuous_timestamp_scan.get() or scan_token != self.timestamp_scan_token:
                 return
+            archive_captured = []
+            if self.archive_capture_mode.get() and labels:
+                # Archive capture is purposely one-read: the user is scrolling
+                # through old history, where a header can disappear before the
+                # next OCR pass. These values stay out of live poll safety.
+                archive_captured = self.record_archive_timestamp_labels(
+                    labels, "continuous_archive_capture"
+                )
             current = {}
             for label in labels:
                 normalized, key = self.normalized_timestamp(label)
@@ -1699,6 +1975,10 @@ class TeamsBotConsoleGUI:
                 details.append(
                     f"logged {len(newly_seen)} new: " + ", ".join(newly_seen[:4])
                 )
+            if archive_captured:
+                details.append(
+                    f"archived {len(archive_captured)} visible: " + ", ".join(archive_captured[:4])
+                )
             elif candidate_keys:
                 candidates = [current[key] for key in sorted(candidate_keys)]
                 details.append(
@@ -1730,13 +2010,16 @@ class TeamsBotConsoleGUI:
                 bare_times_skipped=ambiguous_times,
                 awaiting_confirmation=[current[key] for key in sorted(candidate_keys)],
                 newly_logged=newly_seen,
+                archive_captured=archive_captured,
                 summary=summary,
             )
             # A changed result is shown immediately.  An unchanged result gets
             # a five-second heartbeat, proving the scanner remains alive while
             # avoiding hundreds of Text-widget updates per minute.
             if signature != self.continuous_scan_last_report_signature or scan_number % 10 == 0:
-                if newly_seen:
+                if archive_captured:
+                    activity_summary = f"Archive capture saved {len(archive_captured)} visible time{'s' if len(archive_captured) != 1 else ''}."
+                elif newly_seen:
                     activity_summary = f"Timestamp check found {len(newly_seen)} new time{'s' if len(newly_seen) != 1 else ''}."
                 elif candidate_keys:
                     activity_summary = "Timestamp check found something new and is confirming it."
@@ -1752,7 +2035,7 @@ class TeamsBotConsoleGUI:
                 self.continuous_scan_last_report_signature = signature
         except OCRHelperTimeoutError:
             if self.continuous_timestamp_scan.get() and scan_token == self.timestamp_scan_token:
-                self.on_main(self.continuous_timestamp_scan.set, False)
+                self.on_main(self.stop_continuous_timestamp_scan)
                 self.record_continuous_scan_trace(
                     event="native_ocr_timeout",
                     scan_number=scan_number,
@@ -1764,11 +2047,11 @@ class TeamsBotConsoleGUI:
                 )
         except ScreenCapturePermissionError:
             self.on_main(self.report_missing_screen_permission)
-            self.on_main(self.continuous_timestamp_scan.set, False)
+            self.on_main(self.stop_continuous_timestamp_scan)
         except Exception as error:
             self.record_diagnostic_error("continuous_timestamp_scan", error)
             self.log(f"Continuous timestamp scan paused: {self.describe_error(error)}", "warning")
-            self.on_main(self.continuous_timestamp_scan.set, False)
+            self.on_main(self.stop_continuous_timestamp_scan)
         finally:
             # A watchdog replacement may already be running.  Never clear its
             # in-flight flag from this older worker's finally block.
@@ -1778,17 +2061,57 @@ class TeamsBotConsoleGUI:
 
     @staticmethod
     def timestamp_labels_from_text(lines):
-        """Return only date/time labels; deliberately discard every other OCR result."""
+        """Return only date/time labels; deliberately discard every other OCR result.
+
+        Vision occasionally drops the slash in compact Teams dates (for
+        example, ``8/17 3:24 AM`` becomes ``8117 3.'24 AM``). Repair only this
+        well-formed month/day-plus-clock pattern, and only when it has one
+        unambiguous valid month/day split.
+        """
         pattern = (
             r"\b(?:Today|Yesterday|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)"
             r"(?:\s+at)?\s+\d{1,2}:\d{2}\s*(?:AM|PM)?\b"
             r"|\b\d{1,2}/\d{1,2}(?:/\d{2,4})?\s+\d{1,2}:\d{2}\s*(?:AM|PM)\b"
             r"|\b\d{1,2}/\d{1,2}/\d{2,4}\b"
         )
-        return list(dict.fromkeys(
-            match.group(0) for line in lines
-            for match in re.finditer(pattern, line, flags=re.IGNORECASE)
-        ))
+        labels = []
+        for raw_line in lines:
+            line = re.sub(
+                r"(\d{1,2})\s*[:.;,'`]+\s*(\d{2})\s*(AM|PM)\b",
+                r"\1:\2 \3",
+                raw_line,
+                flags=re.IGNORECASE,
+            )
+            labels.extend(match.group(0) for match in re.finditer(pattern, line, flags=re.IGNORECASE))
+            for compact_date, clock_text in re.findall(
+                r"\b(\d{3,4})\s+(\d{1,2}:\d{2}\s*(?:AM|PM))\b", line,
+                flags=re.IGNORECASE,
+            ):
+                candidates = []
+                # First try the ordinary no-separator case (817 -> 8/17).
+                for split in (1, 2):
+                    month_text, day_text = compact_date[:split], compact_date[split:]
+                    if not day_text:
+                        continue
+                    month, day = int(month_text), int(day_text)
+                    if 1 <= month <= 12 and 1 <= day <= 31:
+                        candidates.append(f"{month}/{day} {clock_text}")
+                # Vision can turn the slash into a literal 1 (8117 -> 8/17).
+                # Three digits are already an ordinary one-digit-month/two-
+                # digit-day form, so only apply this repair to longer strings.
+                if len(compact_date) >= 4:
+                    for separator in (1, 2):
+                        month_text = compact_date[:separator]
+                        day_text = compact_date[separator + 1:]
+                        if not month_text or not day_text:
+                            continue
+                        month, day = int(month_text), int(day_text)
+                        if 1 <= month <= 12 and 1 <= day <= 31:
+                            candidates.append(f"{month}/{day} {clock_text}")
+                candidates = list(dict.fromkeys(candidates))
+                if len(candidates) == 1:
+                    labels.append(candidates[0])
+        return list(dict.fromkeys(labels))
 
     @staticmethod
     def bare_time_labels_from_text(lines):
@@ -1958,31 +2281,84 @@ class TeamsBotConsoleGUI:
         Control or changing the user's desktop arrangement.
         """
         try:
-            result = subprocess.run(
-                ["osascript", "-e", 'tell application "Microsoft Teams" to activate'],
-                capture_output=True, text=True, timeout=3,
-            )
-            if result.returncode != 0:
-                return False
-            if not Accessibility.AXIsProcessTrusted():
-                return True
             process = subprocess.run(
                 ["pgrep", "-o", "-f", "/Microsoft Teams.app/Contents/MacOS/MSTeams"],
                 capture_output=True, text=True, timeout=2,
             )
             pid = int(process.stdout.strip())
-            application = Accessibility.AXUIElementCreateApplication(pid)
-            error, windows = Accessibility.AXUIElementCopyAttributeValue(
-                application, Accessibility.kAXWindowsAttribute, None
-            )
-            if error == 0 and windows:
-                try:
-                    Accessibility.AXUIElementPerformAction(windows[0], Accessibility.kAXRaiseAction)
-                except Exception:
-                    pass
-            return True
         except (OSError, ValueError, subprocess.TimeoutExpired):
+            self.last_teams_activation_detail = "Teams process was unavailable"
             return False
+
+        requested = False
+        try:
+            # This native foreground request is more direct than AppleScript
+            # alone. It asks macOS to activate Teams even when another app is
+            # currently frontmost; macOS can then use the user's normal Space
+            # switching preference for the Teams window.
+            running_app = NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
+            if running_app:
+                requested = bool(running_app.activateWithOptions_(NSApplicationActivateIgnoringOtherApps))
+        except Exception:
+            pass
+
+        try:
+            result = subprocess.run(
+                ["osascript", "-e", 'tell application "Microsoft Teams" to activate'],
+                capture_output=True, text=True, timeout=3,
+            )
+            requested = requested or result.returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+        if not requested:
+            self.last_teams_activation_detail = "macOS rejected the foreground request"
+            return False
+
+        raised = False
+        if Accessibility.AXIsProcessTrusted():
+            try:
+                application = Accessibility.AXUIElementCreateApplication(pid)
+                error, windows = Accessibility.AXUIElementCopyAttributeValue(
+                    application, Accessibility.kAXWindowsAttribute, None
+                )
+                if error == 0 and windows:
+                    window = windows[0]
+                    try:
+                        raised = Accessibility.AXUIElementPerformAction(
+                            window, Accessibility.kAXRaiseAction
+                        ) == 0
+                    except Exception:
+                        pass
+                    # Some Teams builds acknowledge Raise while leaving an
+                    # inactive window behind. Marking it main/focused gives
+                    # the real app window a second, accessibility-approved
+                    # foreground request; failure is harmless on versions
+                    # that expose either attribute as read-only.
+                    for attribute in (
+                        Accessibility.kAXMainAttribute,
+                        Accessibility.kAXFocusedAttribute,
+                    ):
+                        try:
+                            Accessibility.AXUIElementSetAttributeValue(window, attribute, True)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+        self.last_teams_activation_detail = "foreground and window raise requested" if raised else "foreground requested"
+        self.record_history("teams_foreground_requested", window_raise=raised)
+        return True
+
+    def locate_visual_template(self, template, screenshot, **options):
+        """Run one serialized, low-risk OpenCV-backed template comparison."""
+        try:
+            with self.template_match_lock:
+                return pyautogui.locate(template, screenshot, **options)
+        except Exception:
+            # Template matching is a candidate signal only. An unavailable
+            # matcher must make this pass inconclusive, never take down the
+            # app or weaken the later timestamp safeguards.
+            return None
 
     def find_poll_visual(self, screenshot=None, allow_ocr_fallback=False):
         """Find the live Teams Submit control in a screen frame.
@@ -2011,10 +2387,10 @@ class TeamsBotConsoleGUI:
                     for scale in (0.82, 0.90, 1.0, 1.08, 0.5):
                         size = (max(1, round(template.width * scale)), max(1, round(template.height * scale)))
                         candidate = template.resize(size, Image.Resampling.LANCZOS)
-                        try:
-                            match = pyautogui.locate(candidate, screenshot, region=lower_screen, grayscale=True, confidence=0.82)
-                        except pyautogui.ImageNotFoundException:
-                            match = None
+                        match = self.locate_visual_template(
+                            candidate, screenshot, region=lower_screen,
+                            grayscale=True, confidence=0.82,
+                        )
                         if match:
                             return match
             accessible = self.find_submit_accessibility_visual(screenshot)
@@ -2078,7 +2454,7 @@ class TeamsBotConsoleGUI:
                     height = round(size.height * scale_y)
                     if width >= 25 and height >= 18:
                         self.last_capture_size = screenshot.size
-                        return pyautogui.Box(left, top, width, height)
+                        return ScreenBox(left, top, width, height)
             pending.extend(attribute(element, Accessibility.kAXChildrenAttribute) or [])
         return None
 
@@ -2117,7 +2493,7 @@ class TeamsBotConsoleGUI:
                 if width < 25 or height < 12:
                     continue
                 self.last_capture_size = full_screenshot.size
-                return pyautogui.Box(
+                return ScreenBox(
                     round(left + float(item["x"]) * screenshot.width),
                     round(top + (1.0 - float(item["y"]) - float(item["height"])) * screenshot.height),
                     round(width), round(height),
@@ -2134,29 +2510,37 @@ class TeamsBotConsoleGUI:
         return None
 
     def find_teams_notification(self, screenshot=None):
-        """Look for a Teams notification banner that signals chat activity."""
+        """Recognize a specific Workflows poll-card banner, not a generic alert.
+
+        A Teams icon or a generic ``new message`` banner is intentionally not
+        enough to take focus or begin navigation.  The banner must identify
+        Workflows and say ``Sent a card``; the normal in-chat timestamp and
+        Submit safeguards still decide whether it is a fresh poll afterward.
+        """
         try:
             screenshot = screenshot if screenshot is not None else self.capture_screen_image()
             width, height = screenshot.size
             # macOS notification banners appear in the upper-right portion of
             # whichever desktop is currently active.
             banner_region = (round(width * 0.58), 0, round(width * 0.42), round(height * 0.30))
+            icon_match = None
             if os.path.exists(self.notification_icon_path):
                 with Image.open(self.notification_icon_path) as icon:
                     for scale in (1.0, 0.75, 0.5):
                         size = (max(1, round(icon.width * scale)), max(1, round(icon.height * scale)))
                         candidate = icon.resize(size, Image.Resampling.LANCZOS)
-                        try:
-                            match = pyautogui.locate(candidate, screenshot, region=banner_region,
-                                                     grayscale=True, confidence=0.82)
-                        except pyautogui.ImageNotFoundException:
-                            match = None
+                        match = self.locate_visual_template(
+                            candidate, screenshot, region=banner_region,
+                            grayscale=True, confidence=0.82,
+                        )
                         if match:
-                            return match
+                            icon_match = match
+                            break
 
             # Image matching can miss a dark/light Teams icon.  A compact OCR
-            # fallback recognizes only the notification's app/activity labels
-            # (including Workflows' "Sent a card"), never poll content.
+            # OCR confirms the banner's source/activity labels, never its poll
+            # content.  A visual icon match is merely a reason to inspect this
+            # small banner region; it never activates Teams on its own.
             now = time.monotonic()
             if now - self.last_notification_text_probe < 1.5:
                 return None
@@ -2173,12 +2557,12 @@ class TeamsBotConsoleGUI:
                 result = subprocess.run([helper_path, temporary_path, "fast", "text"],
                                         capture_output=True, text=True, timeout=5)
                 text = result.stdout.lower() if result.returncode == 0 else ""
-                teams_marker = any(marker in text for marker in ("microsoft teams", "teams", "workflows"))
-                activity_marker = any(marker in text for marker in ("new message", "new messages", "sent a card"))
-                if teams_marker and activity_marker:
-                    # A box is sufficient here: the monitor uses it only as a
-                    # wake signal, then performs its usual fresh Teams scan.
-                    return pyautogui.Box(*banner_region)
+                workflows_marker = "workflows" in text
+                card_marker = "sent a card" in text
+                if workflows_marker and card_marker:
+                    # A box is sufficient here: it is only a wake signal.  It
+                    # never proves a poll or authorizes a pointer action.
+                    return icon_match or ScreenBox(*banner_region)
             except (OSError, subprocess.TimeoutExpired):
                 pass
             finally:
@@ -2262,10 +2646,9 @@ class TeamsBotConsoleGUI:
                             (round(template.width * scale), round(template.height * scale)),
                             Image.Resampling.LANCZOS,
                         )
-                        try:
-                            match = pyautogui.locate(candidate, screenshot, grayscale=True, confidence=0.84)
-                        except pyautogui.ImageNotFoundException:
-                            match = None
+                        match = self.locate_visual_template(
+                            candidate, screenshot, grayscale=True, confidence=0.84,
+                        )
                         if match:
                             return {
                                 "left": left + match.left,
@@ -2368,6 +2751,10 @@ class TeamsBotConsoleGUI:
             pyautogui.click()
             return True
         return False
+
+    def has_fresh_new_messages_jump(self):
+        """Whether Teams was recently moved to its newest activity by its UI."""
+        return time.monotonic() <= self.new_messages_jump_until
 
     def find_poll_with_scroll(self, allow_any_visible_submit=False, start_at_bottom=False,
                               monitor_token=None, max_scrolls=None):
@@ -2502,10 +2889,9 @@ class TeamsBotConsoleGUI:
                         (round(template.width * scale), round(template.height * scale)),
                         Image.Resampling.LANCZOS,
                     )
-                    try:
-                        match = pyautogui.locate(candidate, screenshot, grayscale=True, confidence=0.84)
-                    except pyautogui.ImageNotFoundException:
-                        match = None
+                    match = self.locate_visual_template(
+                        candidate, screenshot, grayscale=True, confidence=0.84,
+                    )
                     if match:
                         return True
         except ScreenCapturePermissionError:
@@ -2579,6 +2965,7 @@ class TeamsBotConsoleGUI:
         checks the completion toast and Last read divider; the divider narrows
         the search only and never qualifies a poll by itself.
         """
+        self.last_poll_time_check = None
         ocr_items = self.visible_teams_ocr_boxes()
         ocr_lines = [item["text"] for item in ocr_items]
         completed = "your response was sent to the app" in " ".join(ocr_lines).lower()
@@ -2625,11 +3012,11 @@ class TeamsBotConsoleGUI:
             # Teams sometimes renders a fresh card header as just "11:01 PM"
             # instead of "Today 11:01 PM". A bare clock is normally too
             # ambiguous to authorize anything. The one narrow exception is a
-            # positive Teams banner/New messages signal, with that clock in the
-            # same visible card region as this exact Submit. It is still
+            # successful press on Teams' own New messages control, with that
+            # clock in the same visible card region as this exact Submit. It is still
             # converted to today only for the normal five-minute, Last read,
             # completion, duplicate, and final live-recheck gates below.
-            if self.pending_notification_signal:
+            if self.has_fresh_new_messages_jump():
                 for item in ocr_items:
                     if self.timestamp_labels_from_text([item["text"]]):
                         continue
@@ -2670,6 +3057,19 @@ class TeamsBotConsoleGUI:
                 return False, f"no fresh timestamp was verified (closest visible: {latest_label}, {max(0, round(latest_age / 60))} minutes old)"
             return False, "no date-qualified Teams timestamp was visible to verify this poll"
         self.last_verified_poll_timestamps = list(dict.fromkeys(fresh))
+        # Keep one human-readable comparison for the normal Activity feed.
+        # The actual gate above remains the source of truth: only a timestamp
+        # no more than five minutes old (with a one-minute future allowance)
+        # reaches this point.
+        eligible = [entry for entry in dated
+                    if -60 <= entry[0] <= self.MAX_POLL_AGE_SECONDS]
+        if eligible:
+            selected_age, selected_label = min(eligible, key=lambda item: abs(item[0]))
+            self.last_poll_time_check = {
+                "label": selected_label,
+                "age_seconds": selected_age,
+                "checked_at": now,
+            }
         fresh_keys = {
             key for label in self.last_verified_poll_timestamps
             for _display, key in [self.normalized_timestamp(label)] if key
@@ -2885,24 +3285,27 @@ class TeamsBotConsoleGUI:
             self.stop_btn.config(bg=self.SURFACE, fg=self.TEXT,
                                  highlightbackground=self.BORDER, cursor="hand2")
             self.debug_check.config(state=tk.DISABLED)
-            self.test_btn.config(state=tk.DISABLED)
         else:
-            self.badge.config(text="●  Idle", fg=self.MUTED, bg=self.CONTROL)
-            self.set_subtitle(self.idle_subtitle, idle=True)
+            diagnostic_scan_active = self.continuous_timestamp_scan.get()
+            if diagnostic_scan_active:
+                self.badge.config(text="●  Scanning", fg="#9a6700",
+                                  bg="#5A4620" if self.dark_mode else "#FFF1D6")
+                self.set_subtitle("Checking visible Teams timestamps")
+            else:
+                self.badge.config(text="●  Idle", fg=self.MUTED, bg=self.CONTROL)
+                self.set_subtitle(self.idle_subtitle, idle=True)
             self.start_btn.config(text="Start Monitoring", bg=self.SURFACE, fg=self.TEXT,
                                   highlightbackground=self.BORDER, cursor="hand2")
-            self.stop_btn.config(bg=self.CONTROL, fg=self.DISABLED,
-                                 highlightbackground=self.BORDER, cursor="arrow")
+            self.stop_btn.config(bg=self.SURFACE if diagnostic_scan_active else self.CONTROL,
+                                 fg=self.TEXT if diagnostic_scan_active else self.DISABLED,
+                                 highlightbackground=self.BORDER,
+                                 cursor="hand2" if diagnostic_scan_active else "arrow")
             self.debug_check.config(state=tk.NORMAL)
-            self.test_btn.config(state=tk.NORMAL, text="Run detection check")
 
     def start_monitoring(self):
         if self.is_monitoring:
             return
-        if self.continuous_timestamp_scan.get():
-            self.continuous_timestamp_scan.set(False)
-            self.timestamp_scan_token += 1
-            self.record_continuous_scan_trace(event="disabled_for_monitoring")
+        if self.stop_continuous_timestamp_scan():
             self.log("Continuous scan stopped so normal monitoring can start.", "info")
         self.is_monitoring = True
         self.monitor_generation += 1
@@ -2919,6 +3322,8 @@ class TeamsBotConsoleGUI:
         self.pending_poll_anchor = None
         self.last_verified_poll_timestamps = []
         self.pending_notification_signal = False
+        self.new_messages_jump_until = 0.0
+        self.bare_timestamp_retry_count = 0
         self.notification_visible = False
         self.new_messages_indicator_visible = False
         self.new_messages_indicator_box = None
@@ -2960,7 +3365,11 @@ class TeamsBotConsoleGUI:
             self.log(f"Timestamp baseline skipped: {self.describe_error(error)}", "warning")
 
     def stop_monitoring(self):
-        if not self.is_monitoring:
+        was_monitoring = self.is_monitoring
+        stopped_continuous_scan = self.stop_continuous_timestamp_scan()
+        if not was_monitoring:
+            if stopped_continuous_scan:
+                self.log("Continuous timestamp scan stopped.", "warning")
             return
         self.is_monitoring = False
         # Invalidate any monitor pass that is currently validating, scrolling,
@@ -2990,21 +3399,32 @@ class TeamsBotConsoleGUI:
                     self.candidate_signature = None
                     self.candidate_passes = 0
                     self.pending_previous_app = self.active_app_name()
-                    source = "Teams notification" if notification else "Teams New messages indicator"
+                    source = "Verified Workflows card notification" if notification else "Teams New messages indicator"
                     self.log(f"{source} detected. Opening Teams to locate the newest activity.", "info")
                     if not self.activate_teams_window():
                         self.log("Teams could not be brought forward; no click will be attempted until its window is available.", "warning")
                         time.sleep(self.IDLE_SCAN_SECONDS)
                         continue
                     time.sleep(0.5)
-                    # A banner can arrive just before Teams exposes its
-                    # in-window indicator to the discovery capture. Try the
-                    # real control after Teams is foreground for either kind
-                    # of fresh signal; this is a no-op when there is no button.
+                    # A verified banner can arrive just before Teams exposes
+                    # its own New messages control. Re-check after Teams is
+                    # foreground, but do not scroll or move the pointer unless
+                    # that in-app control is actually present.
                     jumped_to_newest = False
-                    if notification or new_messages:
+                    if notification and not new_messages:
+                        new_messages = self.find_new_messages_indicator()
+                    if new_messages:
                         if self.press_new_messages_indicator():
                             jumped_to_newest = True
+                            # Keep this narrowly scoped proof through the
+                            # five-minute eligibility/review window. It is not
+                            # granted by a notification alone, and all of the
+                            # normal timestamp age, Last read, completion,
+                            # history, and final live-card checks still apply.
+                            self.new_messages_jump_until = (
+                                time.monotonic() + self.MAX_POLL_AGE_SECONDS
+                            )
+                            self.bare_timestamp_retry_count = 0
                             # The discovery capture predates the jump. Do not
                             # let an old box from that capture bypass the
                             # fresh, post-jump check below.
@@ -3024,18 +3444,23 @@ class TeamsBotConsoleGUI:
                                 else:
                                     self.log(f"New messages revealed Submit, but it was not ready: {revealed_reason}.", "info")
                                     visual = None
-                        elif new_messages:
-                            self.log("New messages was detected, but its accessible control was unavailable; using the chat-bottom fallback.", "warning")
-                    # The notification points to new activity, so search from
-                    # the newest end of the conversation—not through old
-                    # polls. If the New messages jump already revealed a
-                    # verified card, preserve that position instead.
-                    if not visual:
+                        else:
+                            self.log("New messages was detected, but its accessible control was unavailable; no pointer input will be used.", "warning")
+                    # The strict no-input fallback: a verified banner without
+                    # Teams' own New messages control may inspect a Submit
+                    # already in view, but it must never sweep the chat or
+                    # move the user's pointer.  It will retry on the next
+                    # genuine signal instead.
+                    if not visual and jumped_to_newest:
                         visual = self.find_poll_with_scroll(
                             start_at_bottom=True,
                             monitor_token=monitor_token,
-                            max_scrolls=3 if jumped_to_newest else None,
+                            max_scrolls=3,
                         )
+                    elif not visual:
+                        visual = self.find_poll_visual()
+                        if not visual:
+                            self.log("Verified activity reached Teams, but its New messages control is not ready; no scrolling or pointer input was used.", "info")
                 elif not activity_alert:
                     self.notification_visible = False
                 activity = self.check_validated_teams_logs()
@@ -3070,14 +3495,36 @@ class TeamsBotConsoleGUI:
                     if self.pending_poll_seen_at is None:
                         actionable, reason = self.poll_visual_is_actionable(visual)
                         if not actionable:
+                            # Teams may paint the card header a moment after
+                            # its New messages jump. Give that one fresh,
+                            # successful jump a few compact OCR retries before
+                            # treating the visible card as ineligible. This
+                            # never applies to ordinary scrolling or old cards.
+                            if (self.has_fresh_new_messages_jump()
+                                    and "timestamp directly above" in reason
+                                    and self.bare_timestamp_retry_count < 3):
+                                self.bare_timestamp_retry_count += 1
+                                self.log("Fresh chat activity is settling; confirming its timestamp before deciding.", "info")
+                                time.sleep(self.CANDIDATE_SCAN_SECONDS)
+                                continue
                             self.log(f"Skipping Submit: {reason}. No click will be issued.", "info")
                             self.record_history("poll_search_skipped", reason=reason)
                             self.ignore_visible_poll = True
-                            self.pending_notification_signal = False
                             time.sleep(self.IDLE_SCAN_SECONDS)
                             continue
                         self.pending_poll_seen_at = time.monotonic()
+                        self.bare_timestamp_retry_count = 0
                         self.remember_pending_anchor(visual)
+                        time_check = self.last_poll_time_check
+                        if time_check:
+                            poll_time = time_check["label"]
+                            local_time = time_check["checked_at"].strftime("%I:%M %p").lstrip("0")
+                            age_text = self.describe_timestamp_age(time_check["age_seconds"])
+                            self.log(
+                                f"Time check: Teams shows {poll_time}; local time is {local_time}; it is {age_text} and eligible.",
+                                "info",
+                                simple_message=f"Checked the time: this poll is {age_text}, so it is still eligible.",
+                            )
                         if self.debug_mode.get():
                             self.preview_submit_target(visual, "Diagnostics preview: pointer moved to the dynamic Submit target; no click performed.")
                         deadline = time.strftime("%H:%M:%S", time.localtime(time.time() + self.MAX_POLL_AGE_SECONDS))
@@ -3095,6 +3542,7 @@ class TeamsBotConsoleGUI:
                         # than button position without collecting poll content.
                         labels = self.last_verified_poll_timestamps
                         if labels:
+                            self.mark_timestamp_outcome(labels, "Poll found — awaiting review")
                             new_labels = self.record_new_timestamp_labels(labels, "on_device_ocr")
                             if new_labels:
                                 self.log("New poll timestamp: " + ", ".join(new_labels[:3]), "info")
@@ -3104,6 +3552,7 @@ class TeamsBotConsoleGUI:
                     poll_age = time.monotonic() - self.pending_poll_seen_at
                     if poll_age > self.MAX_POLL_AGE_SECONDS:
                         self.log("This poll is more than five minutes old, so it will be left alone.", "warning")
+                        self.mark_timestamp_outcome(self.last_verified_poll_timestamps, "Expired — no action")
                         self.record_history("poll_expired")
                         self.ignore_visible_poll = True
                         time.sleep(1.0)
@@ -3137,6 +3586,7 @@ class TeamsBotConsoleGUI:
                     self.pending_poll_seen_at = None
                     self.pending_poll_anchor = None
                     self.pending_notification_signal = False
+                    self.bare_timestamp_retry_count = 0
                     time.sleep(self.IDLE_SCAN_SECONDS)
             except ScreenCapturePermissionError:
                 self.is_monitoring = False
@@ -3268,10 +3718,12 @@ class TeamsBotConsoleGUI:
                 pyautogui.click()
             finally:
                 self.bot_click_dispatching = False
+            self.mark_timestamp_outcome(self.last_verified_poll_timestamps, "Submit issued — awaiting Teams confirmation")
             self.record_history("submit_click_issued")
             time.sleep(0.9)
             if not was_already_confirmed and self.submission_confirmation_visible():
                 self.log("Teams confirmed that your response was sent.", "success")
+                self.mark_timestamp_outcome(self.last_verified_poll_timestamps, "Handled — Teams confirmed")
                 self.record_history("submit_confirmed")
                 self.play_submission_sound()
             else:

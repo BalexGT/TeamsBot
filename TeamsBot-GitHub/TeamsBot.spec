@@ -48,4 +48,8 @@ app = BUNDLE(
     name='TeamsBot.app',
     icon='TeamsBot.icns',
     bundle_identifier='com.balexgt.teamsbot',
+    info_plist={
+        'CFBundleShortVersionString': '0.6.0-beta.15.1',
+        'CFBundleVersion': '17',
+    },
 )

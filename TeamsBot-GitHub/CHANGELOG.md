@@ -4,18 +4,121 @@ All notable changes to Teams Bot are recorded here. New work should be added to 
 
 ## Release track
 
-- **Current standard build:** `0.6.0-beta.7` — internal beta.
+- **Current standard build:** `0.6.0-beta.15.1` — internal beta.
 - **Current Graph beta:** `0.7.0-graph-beta.13` — internal beta.
 - **Release target:** `1.0.0` — only after sustained real-world validation:
   reliable fresh-poll detection, no unhandled crashes/OCR stalls, stable
   permissions/installation behavior, and no false normal-mode actions.
 - Every launch records the current build, stage, and target in the local poll
   history, so archived diagnostics can always be tied to a specific version.
+- Release naming: a meaningful behavior, safety, or stability change advances
+  the beta number (for example, `0.6.0-beta.13`); a small visual, wording, or
+  diagnostic polish change uses a patch suffix instead (for example,
+  `0.6.0-beta.13.1`). macOS's internal build number still increases with every
+  installed package.
 - Standard features ship in both editions by default. The Graph-readiness beta
   is reserved for future approved Microsoft integration work or explicit
   experiments, not general feature divergence.
 
 ## Unreleased
+
+- Standard build `0.6.0-beta.15.1`: made the existing five-minute timestamp
+  safeguard visible in Activity. Before a review can begin, TeamsBot now logs
+  the visible Teams time, the Mac's local time, and the calculated poll age.
+
+- Standard build `0.6.0-beta.15`: tightened monitor input safety. A generic
+  Teams-looking notification can no longer activate Teams, scroll its chat, or
+  move the pointer. Automatic review now requires a visible **Workflows — Sent
+  a card** notification and, before any chat navigation, Teams' own live **New
+  messages** control. If that control is not ready, TeamsBot only checks what
+  is already visible and waits without pointer input.
+
+- Standard build `0.6.0-beta.14.1`: fixed the inactive-window appearance.
+  TeamsBot now stays fully opaque while Teams is active, so the desktop can no
+  longer show through the activity panel or monitoring controls.
+
+- Standard build `0.6.0-beta.14`: repaired a specific Teams OCR date pattern
+  seen during archive capture. Vision read the on-screen `8/17 3:24 AM` as
+  `8117 3.'24 AM`; TeamsBot now recognizes this only when it can reconstruct
+  one unambiguous valid month/day and clock, so older timestamps can be
+  captured without weakening normal safety checks.
+
+- Standard build `0.6.0-beta.13`: added explicit **Archive visible history**
+  for Continuous Scan. With this option on, user-driven scrolling saves each
+  clearly date-qualified timestamp after its first good OCR read, avoiding the
+  normal two-read confirmation that can miss headers while scrolling. Archive
+  capture is stored separately and never affects live poll age, no-repeat, or
+  click safeguards. Timestamp Log shows these captures in current and archived
+  sessions.
+
+- Timestamp Log now shows evidence-backed outcomes only where TeamsBot actually
+  verified one: poll awaiting review, expired without action, Submit issued,
+  or Teams-confirmed handling. All other markers remain explicitly labeled as
+  recorded but not assessed as polls.
+
+- Standard build `0.6.0-beta.12`: **Timestamp Log** now includes the entire
+  session archive as well as the current timestamp list. Each archived session
+  is clearly labeled, the full record is scrollable, and it still stores no
+  poll text or screenshots.
+
+- Standard build `0.6.0-beta.11`: removed the redundant **Inspect Current
+  Screen** diagnostic. **Test Newest Submit** in Safe Test Mode provides the
+  same no-click validation plus the newest-chat search when needed.
+
+- Expanded Diagnostics help for **Continuous Scan**. It now explicitly says
+  that you scroll the Teams chat yourself while TeamsBot records the timestamp
+  markers that come into view; it does not scroll on your behalf and it pauses
+  normal Monitoring until you stop the scan.
+
+- Standard build `0.6.0-beta.10`: fixed a monitor error in the notification,
+  Accessibility, and OCR fallbacks. The packaged PyAutoGUI version did not
+  expose its internal `Box` type; TeamsBot now uses its own compatible local
+  rectangle, so a detected banner or Submit control no longer aborts a pass.
+
+- Standard build `0.6.0-beta.9`: **Start New Session** now uses a plain-language
+  confirmation explaining that its timestamp and poll markers protect against
+  revisiting old polls. It makes clear that the current data is archived, not
+  deleted, before a fresh working baseline begins.
+
+- Standard build `0.6.0-beta.8`: constrained OpenCV UI-template matching to
+  one serialized CPU worker and disabled its optional GPU path. A macOS crash
+  report identified an abort in OpenCV's parallel template matcher during a
+  monitor pass; a failed visual match now remains an inconclusive pass rather
+  than terminating TeamsBot.
+
+- Build tracking: the installed app now carries the same visible beta version
+  and internal macOS build number as its activity log. Future installed fixes
+  will advance these together.
+
+- Standard build: Diagnostics now includes a readable, view-only **Timestamp
+  Log** beside Poll History. It lists saved Teams time markers and identifies
+  those already used for poll no-repeat protection; it never includes poll
+  text or screenshots.
+
+- Standard build: scan-based diagnostic tests now stop Monitoring first, and
+  **Stop Monitoring** also cancels Continuous Scan. The Stop control remains
+  available during a continuous diagnostic scan, and the app shows a yellow
+  **Scanning** state so it is clear which process currently owns OCR.
+
+- Standard build: the native menu-bar companion now tracks the main TeamsBot
+  process and exits automatically if the console process ends unexpectedly.
+  This prevents a stranded status-bar icon from implying the monitor is still
+  available when its window and main process are gone.
+
+- Standard build: strengthened the fresh-activity foreground handoff. TeamsBot
+  now uses macOS native app activation, the standard Teams activation request,
+  and an Accessibility window raise/focus request in sequence before locating
+  a newly signaled card. This requests the Teams Space through macOS's normal
+  desktop-switching behavior without changing the user's Space arrangement.
+
+- Standard build: made the **New messages** handoff retain its narrowly scoped
+  fresh-card context through the five-minute review window. When Teams has
+  successfully jumped to the newest chat activity, a card-local bare header
+  clock such as `12:18 AM` can be checked as today's time through the normal
+  age, Last read, completion, history, duplicate, and final live-card gates.
+  A newly revealed card also receives up to three quick timestamp retries
+  while Teams finishes drawing it; ordinary scrolling and old cards never get
+  this exception.
 
 - All macOS editions: adopted the supplied TeamsBot robot artwork as the
   primary logo direction. The compact transparent mark now appears in the

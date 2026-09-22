@@ -1,6 +1,6 @@
 # Teams Bot — Project Context
 
-Last updated: 2026-09-19
+Last updated: 2026-09-22
 
 ## Purpose
 
@@ -10,17 +10,36 @@ The intended end-state is a polished, Mac-like utility that can remain out of th
 
 ## Release track
 
-- **Standard build:** `0.6.0-beta.4` (internal beta).
+- **Standard build:** `0.6.0-beta.15.1` (internal beta).
 - **Graph beta:** `0.7.0-graph-beta.13` (separate internal beta; interactive
   Microsoft browser sign-in verifies only delegated `User.Read`, with no
   Teams-content access).
 - **Target release:** `1.0.0`.
+- **Versioning:** meaningful behavior, safety, or stability changes advance the
+  beta number (for example, `0.6.0-beta.13`); small visual or wording polish
+  uses a patch suffix (for example, `0.6.0-beta.13.1`). The internal macOS
+  build number still advances for every installed package.
 - Each launch writes its version, stage, and release target to
   `poll-history.jsonl`, making future diagnostic archives traceable to the
   build that produced them.
 - Do not call a build release-ready until fresh-poll detection, permission
   behavior, visual/OCR reliability, and false-action prevention have been
   validated over sustained normal use.
+
+### Latest stability polish
+
+The standard app remains fully opaque when it loses focus. This avoids a
+misleading translucent appearance over Teams or the desktop while monitoring.
+
+Monitoring input is deliberately conservative: notifications are wake hints
+only after the visible banner identifies **Workflows** and **Sent a card**.
+Without the live in-app **New messages** control, TeamsBot does not scroll or
+move the pointer.
+
+Before a poll enters its review window, TeamsBot compares the timestamp
+directly above the visible Submit card to the Mac's local clock. It accepts
+only timestamps no more than five minutes old and writes the time comparison
+to Activity for auditing.
 
 ## Current project layout
 
